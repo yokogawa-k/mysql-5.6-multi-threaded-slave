@@ -13,10 +13,12 @@
   * [show slave status のみかた](#show-slave-status-%E3%81%AE%E3%81%BF%E3%81%8B%E3%81%9F)
       * [非並列時（slave_parallel_workers=0）の場合と違うところ](#%E9%9D%9E%E4%B8%A6%E5%88%97%E6%99%82%EF%BC%88slave_parallel_workers%3D0%EF%BC%89%E3%81%AE%E5%A0%B4%E5%90%88%E3%81%A8%E9%81%95%E3%81%86%E3%81%A8%E3%81%93%E3%82%8D)
   * [mysql.slave_worker_info に関して](#mysqlslave_worker_info-%E3%81%AB%E9%96%A2%E3%81%97%E3%81%A6)
-  * [%%FIXME%% start slave until が使えなくなる](#%25%25fixme%25%25-start-slave-until-%E3%81%8C%E4%BD%BF%E3%81%88%E3%81%AA%E3%81%8F%E3%81%AA%E3%82%8B)
-  * [%%FIXME%% ポジションの管理方法](#%25%25fixme%25%25-%E3%83%9D%E3%82%B8%E3%82%B7%E3%83%A7%E3%83%B3%E3%81%AE%E7%AE%A1%E7%90%86%E6%96%B9%E6%B3%95)
-  * [%%FIXME%% slave_parallel_workers を ON => OFF にした場合](#%25%25fixme%25%25-slave_parallel_workers-%E3%82%92-on-%3D%3E-off-%E3%81%AB%E3%81%97%E3%81%9F%E5%A0%B4%E5%90%88)
-  * [%%FIXME%% SQL_THREAD が止まった場合の復旧方法](#%25%25fixme%25%25-sql_thread-%E3%81%8C%E6%AD%A2%E3%81%BE%E3%81%A3%E3%81%9F%E5%A0%B4%E5%90%88%E3%81%AE%E5%BE%A9%E6%97%A7%E6%96%B9%E6%B3%95)
+  * [start slave until がサポートされていない](#start-slave-until-%E3%81%8C%E3%82%B5%E3%83%9D%E3%83%BC%E3%83%88%E3%81%95%E3%82%8C%E3%81%A6%E3%81%84%E3%81%AA%E3%81%84)
+  * [ポジションの管理方法](#%E3%83%9D%E3%82%B8%E3%82%B7%E3%83%A7%E3%83%B3%E3%81%AE%E7%AE%A1%E7%90%86%E6%96%B9%E6%B3%95)
+    * [relay_log_info_repository が `TABLE` の場合](#relay_log_info_repository-%E3%81%8C-%60table%60-%E3%81%AE%E5%A0%B4%E5%90%88)
+    * [relay_log_info_repository が `FILE` の場合](#relay_log_info_repository-%E3%81%8C-%60file%60-%E3%81%AE%E5%A0%B4%E5%90%88)
+  * [slave_parallel_workers を ON => OFF にした場合](#slave_parallel_workers-%E3%82%92-on-%3D%3E-off-%E3%81%AB%E3%81%97%E3%81%9F%E5%A0%B4%E5%90%88)
+  * [SQL_THREAD が止まった場合の復旧方法](#sql_thread-%E3%81%8C%E6%AD%A2%E3%81%BE%E3%81%A3%E3%81%9F%E5%A0%B4%E5%90%88%E3%81%AE%E5%BE%A9%E6%97%A7%E6%96%B9%E6%B3%95)
 * [参考サイト](#%E5%8F%82%E8%80%83%E3%82%B5%E3%82%A4%E3%83%88)
 
 # はじめに
@@ -138,7 +140,7 @@ start slave 実行時に以下のメッセージが Error_log に出力された
 #### slave_parallel_workers
 
 * 設定値は並列に動く "SQL" Thread 数
-* デフォルトは 0、最大 1024 %%FIXME%% 1 の場合と 0 の場合で違うのか？
+* デフォルトは 0、最大 1024
 
 
 #### slave_checkpoint_period
@@ -246,19 +248,149 @@ Checkpoint_master_log_name:
 ```
 
 
-## %%FIXME%% start slave until が使えなくなる
-* MySQL 5.6 の start slave の調査が必要
+## start slave until がサポートされていない
+
+マニュアルにも書いてあるが、multi-threaded mode では `start slave until` がサポートされていない。
+
+では、実際に試すとどのようになるのだろうか。
+
+```console
+root@slave[(none)]> show variables like 'slave_parallel_workers';
++------------------------+-------+
+| Variable_name          | Value |
++------------------------+-------+
+| slave_parallel_workers | 4     |
++------------------------+-------+
+1 row in set (0.00 sec)
+
+root@slave[(none)]> start slave until master_log_file='mysql-bin.000003',master_log_pos=24575681;
+Query OK, 0 rows affected, 2 warnings (0.01 sec)
+ 
+root@slave[(none)]> show warnings;
++-------+------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Level | Code | Message     |
++-------+------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Note  | 1278 | It is recommended to use --skip-slave-start when doing step-by-step replication with START SLAVE UNTIL; otherwise, you will get problems if you get an unexpected slave's mysqld restart |
+| Note  | 1753 | UNTIL condtion is not supported in multi-threaded slave mode. Slave is started in the sequential execution mode.     |
++-------+------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+```
+
+multi-threaded はサポートされてないから、**sequential execution mode** で開始されてる模様。
+この場合、`slave_parallel_workers=0` として SQL_THREAD が実行されている（rpl_slave.cc より）。
+
+この `start slave` により、IO_THREAD は開始される。SQL_THREAD も指定したポジションまで実行される。
+
+エラーログには以下の様なログがでる。
+
+```text
+12185 [Note] Slave I/O thread: connected to master 'repl@master:3306',replication started in log 'mysql-bin.000003' at position 24050684
+12185 [Note] Slave SQL thread initialized, starting replication in log 'mysql-bin.000003' at position 24050684, relay log './relay-bin.000001' position: 4
+12185 [Note] Slave SQL thread stopped because it reached its UNTIL position 24575681
+```
+
+これらから、サポートされてないが使えないわけではなく、モードが変わって実行されている模様。つまり、パフォーマンス以外では気にしなくていい。
 
 
-## %%FIXME%% ポジションの管理方法
+## ポジションの管理方法
 * 各 SQL_THREAD の実行しているポジションはどこで管理されているのか
-  * relay_log_info_repository が TABLE の場合は、mysql.slave_worker_info で、ファイルの場合は管理されてない？
+
+### relay_log_info_repository が `TABLE` の場合
+
+`mysql.slave_worker_info` テーブルに以下のように管理され、MySQL を停止した際もその続きから実行される。
+
+```console
+root@slave[(none)]> select * from mysql.slave_worker_info\G;
+*************************** 1. row ***************************
+~snip~
+*************************** 2. row ***************************
+                        Id: 2
+            Relay_log_name: ./relay-bin.000004
+             Relay_log_pos: 58232125
+           Master_log_name: mysql-bin.000003
+            Master_log_pos: 106332955
+ Checkpoint_relay_log_name: ./relay-bin.000004
+  Checkpoint_relay_log_pos: 34096095
+Checkpoint_master_log_name: mysql-bin.000003
+ Checkpoint_master_log_pos: 82196925
+          Checkpoint_seqno: 49
+     Checkpoint_group_size: 64
+   Checkpoint_group_bitmap: 
+*************************** 3. row ***************************
+                        Id: 3
+            Relay_log_name: ./relay-bin.000004
+             Relay_log_pos: 24131431
+           Master_log_name: mysql-bin.000003
+            Master_log_pos: 72232261
+ Checkpoint_relay_log_name: ./relay-bin.000004
+  Checkpoint_relay_log_pos: 7343097
+Checkpoint_master_log_name: mysql-bin.000003
+ Checkpoint_master_log_pos: 55443927
+          Checkpoint_seqno: 34
+     Checkpoint_group_size: 64
+   Checkpoint_group_bitmap: 
+*************************** 4. row ***************************
+                        Id: 4
+            Relay_log_name: ./relay-bin.000004
+             Relay_log_pos: 13112113
+           Master_log_name: mysql-bin.000003
+            Master_log_pos: 61212943
+ Checkpoint_relay_log_name: ./relay-bin.000004
+  Checkpoint_relay_log_pos: 283
+Checkpoint_master_log_name: mysql-bin.000003
+ Checkpoint_master_log_pos: 48101113
+          Checkpoint_seqno: 26
+     Checkpoint_group_size: 64
+   Checkpoint_group_bitmap:
+```
+
+### relay_log_info_repository が `FILE` の場合
+
+「slave_parallel_workers が 1以上」かつ「relay_log_info_repository が `TABLE`」の場合に以下の様なメッセージがエラーログにでる。
+
+```text
+10151 [Warning] Slave SQL: If a crash happens this configuration does not guarantee that the relay log info will be consistent, Error_code: 0
+```
+
+また、この設定で SQL_THREAD で処理している状態のまま MySQL を終了した場合以下の様なメッセージがでて処理が終了するまで待たされる。
+
+```text
+10151 [Warning] Slave SQL: Coordinator thread of multi-threaded slave is being stopped in the middle of assigning a group of events; deferring to exit until the group completion  ... , Error_code: 0
+```
+
+つまり、この設定の場合は通常どおり MySQL の Start/Stop は問題ないが、Crash した場合はデータが保証されない（タイミングによっては壊れる）。
 
 
-## %%FIXME%% slave_parallel_workers を ON => OFF にした場合
+## slave_parallel_workers を ON => OFF にした場合
+
+`set global` で変更した場合、SQL_THREAD を繋ぎ直すまでは特に何も発生しない。エラーログも warning もでない。
+SQL_THREAD を繋ぎ直したら反映される。その際の処理は relay_log_info_repository の設定よって違うが、挙動は上記の通り。
 
 
-## %%FIXME%% SQL_THREAD が止まった場合の復旧方法
+## SQL_THREAD が止まった場合の復旧方法
+
+Slave に直接データを書込、Duplicate key で止めた場合に `show slave status` に以下の様なメッセージ
+
+```
+Last_SQL_Error: Worker 3 failed executing transaction '' at master log mysql-bin.000003, end_log_pos 415313849; Error 'Duplicate entry '1' for key 'PRIMARY'' on query. Default database: 'stest01'. Query: 'insert into aaa (`id`,`name`) values (1,'fizz')'
+```
+
+エラーログには以下の様なメッセージ
+
+```
+15063 [ERROR] Slave SQL: Worker 3 failed executing transaction '' at master log mysql-bin.000003, end_log_pos 415313849; Error 'Duplicate entry '1' for key 'PRIMARY'' on query. Default database: 'stest01'. Query: 'insert into aaa (`id`,`name`) values (1,'fizz')', Error_code: 1062
+15063 [Warning] Slave SQL: ... The slave coordinator and worker threads are stopped, possibly leaving data in inconsistent state. A restart should restore consistency automatically, although using non-transactional storage for data or info tables or DDL queries could lead to problems. In such cases you have to examine your data (see documentation for details). Error_code: 1756
+```
+
+この場合、slave から該当データを delete して `start slave`。
+
+
+`SQL_SLAVE_SKIP_COUNTER=n` はエラーもなく使えてしまうが期待通り skip されるとは限らない。
+
+```
+15063 [Note] 'SQL_SLAVE_SKIP_COUNTER=1' executed at relay_log_file='./relay-bin.000027', relay_log_pos='760', master_log_name='mysql-bin.000003', master_log_pos='415313637' and new position at relay_log_file='./relay-bin.000027', relay_log_pos='1003', master_log_name='mysql-bin.000003', master_log_pos='415313880'
+```
+
+基本的には multi-threaded じゃない場合と同じだが、SQL_SLAVE_SKIP_COUNTER は使えないと思ったほうがいい。
 
 
 # 参考サイト
